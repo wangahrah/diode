@@ -110,12 +110,21 @@ def compile_project(
     # Determine success: no error-level diagnostics
     has_errors = any(d.severity == DiodeSeverity.ERROR for d in diagnostics)
 
-    return CompilationResult(
+    result = CompilationResult(
         compilation=compilation,
         diagnostics=diagnostics,
         source_files=source_paths,
         success=not has_errors,
     )
+
+    # Keep pyslang objects alive: the Compilation C++ object references memory
+    # owned by the SourceManager and SyntaxTrees. Python's garbage collector
+    # may free them prematurely when this function returns, causing
+    # use-after-free in subsequent sourceManager calls. Storing references on
+    # the mutable CompilationResult keeps them alive for the result's lifetime.
+    result._pyslang_keep_alive = (source_manager, bag, trees)  # type: ignore[attr-defined]
+
+    return result
 
 
 def _create_syntax_tree(
