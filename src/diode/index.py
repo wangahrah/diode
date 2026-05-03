@@ -98,7 +98,26 @@ class SymbolIndex:
         if candidates:
             # Pick the narrowest (most specific) range
             candidates.sort(key=lambda s: _range_size(s.definition.range))
-            return candidates[0]
+            best = candidates[0]
+
+            # If the narrowest match is a scope (always block, generate, module body),
+            # verify the cursor is actually on that symbol's name — not just inside it.
+            # If the word under cursor doesn't match, fall through to word lookup.
+            scope_kinds = (
+                DiodeSymbolKind.ALWAYS,
+                DiodeSymbolKind.GENERATE,
+                DiodeSymbolKind.MODULE,
+                DiodeSymbolKind.INTERFACE,
+                DiodeSymbolKind.PACKAGE,
+            )
+            if best.kind in scope_kinds:
+                word = self._extract_word_at(resolved, position)
+                if word and word != best.name:
+                    # Cursor is inside the scope but on a different identifier
+                    result = self.find_definition(word, resolved)
+                    if result is not None:
+                        return result
+            return best
 
         # Step 4: Word-under-cursor fallback
         word = self._extract_word_at(resolved, position)
@@ -365,6 +384,52 @@ class _IndexBuilder:
         """Register a reference location for a given symbol name."""
         self.references_by_name[name].append(location)
 
+    def _collect_expression_references(self, sym: Any) -> None:
+        """Walk a symbol's AST to collect all named value references.
+
+        Uses pyslang's visitor to traverse statements and expressions inside
+        procedural blocks and continuous assignments, recording each
+        NamedValueExpression as a reference site.
+        """
+        def _visitor(node: Any) -> "pyslang.VisitAction":
+            if isinstance(node, pyslang.NamedValueExpression):
+                ref_sym = node.symbol
+                sr = node.sourceRange
+                start_loc = sr.start
+                if start_loc == self._no_location:
+                    return pyslang.VisitAction.Advance
+                try:
+                    line = self._sm.getLineNumber(start_loc) - 1
+                    col = self._sm.getColumnNumber(start_loc) - 1
+                    buf_id = start_loc.buffer
+                    try:
+                        full_path = self._sm.getFullPath(buf_id)
+                        file_path = Path(full_path)
+                    except Exception:
+                        fname = self._sm.getFileName(start_loc)
+                        file_path = Path(fname) if fname else None
+                    if file_path is None:
+                        return pyslang.VisitAction.Advance
+
+                    name = ref_sym.name
+                    end_col = col + len(name)
+                    location = FileLocation(
+                        path=file_path,
+                        range=FileRange(
+                            start=FilePosition(line=max(0, line), column=max(0, col)),
+                            end=FilePosition(line=max(0, line), column=max(0, end_col)),
+                        ),
+                    )
+                    self._add_reference(name, location)
+                except Exception:
+                    logger.debug(f"Failed to get reference location for: {getattr(ref_sym, 'name', '?')}")
+            return pyslang.VisitAction.Advance
+
+        try:
+            sym.visit(_visitor)
+        except Exception:
+            logger.debug("Failed to walk expression references")
+
     # --- Walk functions for different symbol types ---
 
     def _walk_definition(self, defn: Any) -> None:
@@ -535,6 +600,7 @@ class _IndexBuilder:
             self._extract_instance(sym, parent_name)
         elif isinstance(sym, pyslang.ProceduralBlockSymbol):
             self._extract_procedural_block(sym, parent_name)
+            self._collect_expression_references(sym)
         elif isinstance(sym, pyslang.GenerateBlockArraySymbol):
             self._extract_generate_block(sym, parent_name)
         elif isinstance(sym, pyslang.GenerateBlockSymbol):
@@ -548,8 +614,7 @@ class _IndexBuilder:
         elif isinstance(sym, pyslang.TransparentMemberSymbol):
             self._extract_enum_member(sym, parent_name)
         elif isinstance(sym, pyslang.ContinuousAssignSymbol):
-            # Continuous assignments (assign statements) -- no named symbol
-            pass
+            self._collect_expression_references(sym)
         elif isinstance(sym, pyslang.GenvarSymbol):
             # Genvars are internal to generate blocks
             pass

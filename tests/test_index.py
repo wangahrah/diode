@@ -367,17 +367,14 @@ class TestLookupAt:
         assert sym.name == "count_next"
         assert sym.kind == DiodeSymbolKind.SIGNAL
 
-    def test_lookup_at_word_under_cursor_fallback(self) -> None:
-        """Cursor on a reference should use word-under-cursor fallback."""
+    def test_lookup_at_reference_inside_scope(self) -> None:
+        """Cursor on a reference inside a scope should resolve the symbol, not the scope."""
         index = _build_simple_index()
         path = SIMPLE_MODULE.resolve()
-        # Line 38: "count <= count_next;" (0-based line=37)
-        # "count_next" starts at some column within the always_ff block
-        # Since always_ff is the narrowest container, it will match first.
-        # But if we click on a word that's NOT inside any specific symbol's
-        # range, the fallback should kick in.
-        # Let's use find_definition directly as a more reliable test:
-        sym = index.find_definition("count_next", path)
+        # Line 27 (0-based: 26): "        count_next = count + 1'b1;"
+        # "count_next" starts at column 8 (0-based), inside the always_comb block.
+        # Should resolve to the signal, not to always_comb.
+        sym = index.lookup_at(path, FilePosition(line=26, column=8))
         assert sym is not None
         assert sym.name == "count_next"
         assert sym.kind == DiodeSymbolKind.SIGNAL
