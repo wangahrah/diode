@@ -1,0 +1,5 @@
+[project]
+top = "top_design"
+files = ["sv_sources/*.sv"]
+include_dirs = ["includes"]
+defines = { SYNTHESIS = "1", WIDTH = "8" }

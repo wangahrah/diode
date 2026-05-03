@@ -1,0 +1,6 @@
+[project]
+top = "mod_a"
+files = ["sv_sources/mod_a.sv"]
+file_list = "nested.f"
+include_dirs = ["includes"]
+defines = { TOP_DEFINE = "1" }
