@@ -222,20 +222,52 @@ diode-ls                    # STDIO mode (default, for editors)
 diode-ls --tcp --port 8080  # TCP mode (for debugging)
 ```
 
-## Phase 2: Intelligence (planned, not committed)
+## Phase 2: Intelligence (current)
 
-Features that make diode genuinely powerful, beyond basic navigation:
+Three features, prioritized by value and effort:
 
-- **Completion**: Port names during module instantiation, signal names in
-  expressions, package members after `::`, parameter names in `#()`
-- **Code actions**:
-  - Generate module instantiation template (with all ports)
-  - Auto-connect ports by name/regex
-  - Wrap selection in `always_ff`/`always_comb` block
-  - Add missing `default` to case statements
+### 2a. Completion (`textDocument/completion`) — high effort, high value
+
+Context-aware autocomplete for SystemVerilog. The feature that turns a language
+server from "useful" to "essential." Trigger characters: `.`, `:`, `$`.
+
+Completion contexts, in implementation priority order:
+
+1. **In-scope identifiers**: Signals, parameters, functions visible from cursor.
+   Walks scope hierarchy (local → enclosing module → imported packages).
+2. **Module names**: For module instantiation — all `module`/`interface`
+   definitions in the project.
+3. **Port connections**: Inside `.port_name()` instantiation syntax — shows
+   unconnected ports from the module's port list.
+4. **Package members**: After `pkg::` — enumerates members of the named package.
+5. **Dot-completion**: After `my_struct.` — resolves the prefix type and
+   shows struct fields, enum values, class members.
+6. **System tasks**: After `$` — `$display`, `$clog2`, `$finish`, etc.
+7. **Parameter overrides**: Inside `#(` — shows overridable parameters.
+
+Explicitly excluded: macro completion (backtick), keyword completion.
+
+Architecture: new `completion.py` module handles context detection and candidate
+generation. Uses live pyslang `Compilation` queries (scope iteration, lookupName,
+type resolution). Does NOT import pygls — server.py handles LSP mapping.
+
+### 2b. Workspace symbols (`workspace/symbol`) — low effort, high value
+
+Search all modules, packages, interfaces, functions across the entire project.
+Drives Telescope/Ctrl+T symbol search in editors. Nearly free — the existing
+`SymbolIndex` already stores symbols by name.
+
+### 2c. Document highlight (`textDocument/documentHighlight`) — low effort, medium value
+
+Highlight all occurrences of the symbol under cursor within the same file.
+Declaration sites get "Write" highlight kind, usage sites get "Read."
+Uses existing index reference data, filtered to the current file.
+
+### Phase 2 deferred (stretch goals, may slip to phase 3)
+
+- **Code actions**: Module instantiation template, auto-connect ports
 - **Rename symbol**: Across files, hierarchy-aware
 - **Inlay hints**: Resolved parameter values, signal widths
-- **Workspace symbols**: Search all modules, packages, interfaces in project
 
 ## Phase 3: FPGA workflow (planned, not committed)
 

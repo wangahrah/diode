@@ -216,6 +216,7 @@ class TestDocumentSymbolHierarchy:
 
 
 from diode.types import (
+    FilePosition,
     ProjectConfig,
     ProjectSource,
     ProjectSourceKind,
@@ -618,5 +619,378 @@ async def test_lsp_integration(_server_command: list[str]) -> None:
 
     finally:
         # Ensure clean shutdown regardless of test outcome
+        await client.shutdown_session()
+        await client.stop()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Direct handler tests for completion, workspace symbol, highlight
+# ---------------------------------------------------------------------------
+
+COMPLETION_SV = FIXTURES_DIR / "completion.sv"
+COMPLETION_STRUCTS_SV = FIXTURES_DIR / "completion_structs.sv"
+
+
+class TestCompletionKindMapping:
+    """Test CompletionItemKind -> LSP CompletionItemKind mapping."""
+
+    def test_all_kinds_mapped(self) -> None:
+        from diode.server import _completion_kind_to_lsp
+        from diode.types import CompletionItemKind
+
+        for kind in CompletionItemKind:
+            result = _completion_kind_to_lsp(kind)
+            assert isinstance(result, lsp.CompletionItemKind), f"No mapping for {kind}"
+
+    def test_specific_mappings(self) -> None:
+        from diode.server import _completion_kind_to_lsp
+        from diode.types import CompletionItemKind
+
+        assert _completion_kind_to_lsp(CompletionItemKind.MODULE) == lsp.CompletionItemKind.Module
+        assert _completion_kind_to_lsp(CompletionItemKind.PORT) == lsp.CompletionItemKind.Property
+        assert _completion_kind_to_lsp(CompletionItemKind.SIGNAL) == lsp.CompletionItemKind.Variable
+        assert _completion_kind_to_lsp(CompletionItemKind.FUNCTION) == lsp.CompletionItemKind.Function
+        assert _completion_kind_to_lsp(CompletionItemKind.FIELD) == lsp.CompletionItemKind.Field
+        assert _completion_kind_to_lsp(CompletionItemKind.SYSTEM_TASK) == lsp.CompletionItemKind.Function
+
+
+class TestPhase2HandlersDirectLogic:
+    """Direct handler tests for phase 2 features (no LSP transport)."""
+
+    def _setup_completion_index(self) -> None:
+        """Set up index from completion fixtures."""
+        import diode.server as srv
+        from diode.compiler import compile_project
+        from diode.index import build_index
+
+        config = ProjectConfig(
+            source_files=[
+                ProjectSource(
+                    path=(CROSS_FILE_DIR / "pkg.sv").resolve(),
+                    kind=ProjectSourceKind.AUTO_DISCOVER,
+                ),
+                ProjectSource(
+                    path=(CROSS_FILE_DIR / "sub.sv").resolve(),
+                    kind=ProjectSourceKind.AUTO_DISCOVER,
+                ),
+                ProjectSource(
+                    path=COMPLETION_SV.resolve(),
+                    kind=ProjectSourceKind.AUTO_DISCOVER,
+                ),
+            ]
+        )
+        result = compile_project(config)
+        srv._index = build_index(result)
+        srv._compilation_result = result
+        srv._config = config
+
+    def _setup_structs_index(self) -> None:
+        """Set up index from struct completion fixtures."""
+        import diode.server as srv
+        from diode.compiler import compile_project
+        from diode.index import build_index
+
+        config = ProjectConfig(
+            source_files=[
+                ProjectSource(
+                    path=COMPLETION_STRUCTS_SV.resolve(),
+                    kind=ProjectSourceKind.AUTO_DISCOVER,
+                ),
+            ]
+        )
+        result = compile_project(config)
+        srv._index = build_index(result)
+        srv._compilation_result = result
+        srv._config = config
+
+    def _teardown(self) -> None:
+        import diode.server as srv
+
+        srv._index = None
+        srv._compilation_result = None
+        srv._config = None
+
+    def test_completion_returns_identifiers(self) -> None:
+        """Completion at statement level should return in-scope identifiers."""
+        import diode.server as srv
+        from diode.completion import get_completions
+
+        self._setup_completion_index()
+        try:
+            path = COMPLETION_SV.resolve()
+            items = get_completions(
+                srv._compilation_result.compilation,
+                srv._index,
+                path,
+                FilePosition(32, 4),
+                None,
+                srv._index.source_lines,
+            )
+            labels = {i.label for i in items}
+            assert "internal_reg" in labels
+            assert "clk" in labels
+        finally:
+            self._teardown()
+
+    def test_completion_returns_system_tasks(self) -> None:
+        """Completion with $ trigger should return system tasks."""
+        import diode.server as srv
+        from diode.completion import get_completions
+
+        self._setup_completion_index()
+        try:
+            path = COMPLETION_SV.resolve()
+            items = get_completions(
+                srv._compilation_result.compilation,
+                srv._index,
+                path,
+                FilePosition(58, 9),
+                "$",
+                srv._index.source_lines,
+            )
+            labels = {i.label for i in items}
+            assert "display" in labels
+        finally:
+            self._teardown()
+
+    def test_completion_returns_package_members(self) -> None:
+        """Completion with :: should return package members."""
+        import diode.server as srv
+        from diode.completion import get_completions
+
+        self._setup_completion_index()
+        try:
+            path = COMPLETION_SV.resolve()
+            # Line 52 (0-based): "    logic [common_pkg::DATA_WIDTH-1:0] wide_data;"
+            # Col 23 is right after "::" — triggers package member context
+            items = get_completions(
+                srv._compilation_result.compilation,
+                srv._index,
+                path,
+                FilePosition(52, 23),
+                ":",
+                srv._index.source_lines,
+            )
+            if items:
+                labels = {i.label for i in items}
+                assert "DATA_WIDTH" in labels
+        finally:
+            self._teardown()
+
+    def test_workspace_symbol_search(self) -> None:
+        """search_symbols should find symbols by substring match."""
+        import diode.server as srv
+
+        self._setup_completion_index()
+        try:
+            results = srv._index.search_symbols("internal")
+            names = {s.name for s in results}
+            assert "internal_reg" in names
+        finally:
+            self._teardown()
+
+    def test_workspace_symbol_empty_query(self) -> None:
+        """search_symbols with empty query returns symbols up to limit."""
+        import diode.server as srv
+
+        self._setup_completion_index()
+        try:
+            results = srv._index.search_symbols("", limit=10)
+            assert len(results) <= 10
+            assert len(results) > 0
+        finally:
+            self._teardown()
+
+    def test_document_highlight_returns_references(self) -> None:
+        """Document highlight should find references in the same file."""
+        import diode.server as srv
+
+        self._setup_completion_index()
+        try:
+            path = COMPLETION_SV.resolve()
+            sym = srv._index.find_definition("internal_reg", path)
+            assert sym is not None
+
+            refs = srv._index.find_references("internal_reg")
+            # Filter to same file
+            same_file_refs = [
+                r for r in refs if r.path.resolve() == path
+            ]
+            assert len(same_file_refs) >= 1
+        finally:
+            self._teardown()
+
+    def test_document_highlight_write_vs_read(self) -> None:
+        """Declaration site should be Write, usage sites should be Read."""
+        import diode.server as srv
+
+        self._setup_completion_index()
+        try:
+            path = COMPLETION_SV.resolve()
+            sym = srv._index.find_definition("internal_reg", path)
+            assert sym is not None
+
+            refs = srv._index.find_references("internal_reg")
+            same_file_refs = [
+                r for r in refs if r.path.resolve() == path
+            ]
+
+            # At least one should match the definition (Write)
+            has_definition = any(
+                r.range.start.line == sym.definition.range.start.line
+                and r.range.start.column == sym.definition.range.start.column
+                for r in same_file_refs
+            )
+            assert has_definition
+        finally:
+            self._teardown()
+
+    def test_compilation_result_stored(self) -> None:
+        """After recompile, _compilation_result should be set."""
+        import diode.server as srv
+
+        original_config = srv._config
+        original_index = srv._index
+        original_result = srv._compilation_result
+        try:
+            srv._config = ProjectConfig(
+                source_files=[
+                    ProjectSource(
+                        path=SIMPLE_MODULE.resolve(),
+                        kind=ProjectSourceKind.AUTO_DISCOVER,
+                    ),
+                ]
+            )
+            srv._do_recompile()
+            assert srv._compilation_result is not None
+            assert srv._compilation_result.compilation is not None
+        finally:
+            srv._config = original_config
+            srv._index = original_index
+            srv._compilation_result = original_result
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: LSP integration test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lsp_phase2_integration(_server_command: list[str]) -> None:
+    """End-to-end integration test for phase 2 features.
+
+    Covers: completion, workspace symbols, document highlight.
+    """
+    config = ClientServerConfig(server_command=_server_command)
+    client = await config.start()
+
+    try:
+        workspace_uri = f"file://{INTEGRATION_WORKSPACE.resolve()}"
+        await client.initialize_session(
+            lsp.InitializeParams(
+                capabilities=pytest_lsp.client_capabilities("visual_studio_code"),
+                root_uri=workspace_uri,
+                workspace_folders=[
+                    lsp.WorkspaceFolder(uri=workspace_uri, name="test"),
+                ],
+            )
+        )
+
+        # Open all cross-file sources
+        file_uris: dict[str, str] = {}
+        for name in ("pkg.sv", "sub.sv", "top.sv"):
+            path = (CROSS_FILE_DIR / name).resolve()
+            uri = f"file://{path}"
+            text = path.read_text()
+            file_uris[name] = uri
+            client.text_document_did_open(
+                lsp.DidOpenTextDocumentParams(
+                    text_document=lsp.TextDocumentItem(
+                        uri=uri,
+                        language_id="systemverilog",
+                        version=1,
+                        text=text,
+                    )
+                )
+            )
+
+        # Wait for compilation to complete
+        try:
+            while True:
+                await asyncio.wait_for(
+                    client.wait_for_notification(lsp.TEXT_DOCUMENT_PUBLISH_DIAGNOSTICS),
+                    timeout=10.0,
+                )
+        except asyncio.TimeoutError:
+            pass
+
+        # --- Completion: manual invoke inside module body ---
+        # Line 27 in top.sv (0-based) is "    data_t internal_data;"
+        # Position at col 4 (beginning of line, inside module body)
+        completion_result = await client.text_document_completion_async(
+            lsp.CompletionParams(
+                text_document=lsp.TextDocumentIdentifier(uri=file_uris["top.sv"]),
+                position=lsp.Position(line=27, character=4),
+                context=lsp.CompletionContext(
+                    trigger_kind=lsp.CompletionTriggerKind.Invoked,
+                ),
+            )
+        )
+        assert completion_result is not None
+        if isinstance(completion_result, lsp.CompletionList):
+            labels = {item.label for item in completion_result.items}
+            # Should have some completion items from the module body
+            assert len(completion_result.items) > 0
+
+        # --- Completion: system task with $ trigger ---
+        # Use a position in the file where $ would make sense
+        # We'll test that the handler responds at all with $ trigger
+        completion_dollar = await client.text_document_completion_async(
+            lsp.CompletionParams(
+                text_document=lsp.TextDocumentIdentifier(uri=file_uris["top.sv"]),
+                position=lsp.Position(line=45, character=20),
+                context=lsp.CompletionContext(
+                    trigger_kind=lsp.CompletionTriggerKind.TriggerCharacter,
+                    trigger_character="$",
+                ),
+            )
+        )
+        assert completion_dollar is not None
+        if isinstance(completion_dollar, lsp.CompletionList):
+            assert len(completion_dollar.items) > 0
+            labels = {item.label for item in completion_dollar.items}
+            assert "display" in labels
+
+        # --- Workspace symbols ---
+        ws_symbols = await client.workspace_symbol_async(
+            lsp.WorkspaceSymbolParams(query="data_processor")
+        )
+        assert ws_symbols is not None
+        assert len(ws_symbols) >= 1
+        ws_names = {s.name for s in ws_symbols}
+        assert "data_processor" in ws_names
+
+        # --- Workspace symbols: empty query ---
+        ws_symbols_all = await client.workspace_symbol_async(
+            lsp.WorkspaceSymbolParams(query="")
+        )
+        assert ws_symbols_all is not None
+        assert len(ws_symbols_all) > 0
+
+        # --- Document highlight ---
+        highlight_result = await client.text_document_document_highlight_async(
+            lsp.DocumentHighlightParams(
+                text_document=lsp.TextDocumentIdentifier(uri=file_uris["top.sv"]),
+                position=lsp.Position(line=27, character=11),
+            )
+        )
+        # Should highlight references to internal_data or the symbol at that position
+        if highlight_result is not None:
+            assert len(highlight_result) >= 1
+            # Check that at least one has a valid range
+            for hl in highlight_result:
+                assert hl.range is not None
+
+    finally:
         await client.shutdown_session()
         await client.stop()

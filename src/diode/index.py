@@ -214,6 +214,59 @@ class SymbolIndex:
         symbols = self._symbols_by_file.get(resolved, [])
         return sorted(symbols, key=lambda s: (s.definition.range.start.line, s.definition.range.start.column))
 
+    @property
+    def source_lines(self) -> dict[Path, list[str]]:
+        """Expose cached source lines for use by completion module.
+
+        Returns the internal source line cache. Read-only access.
+        """
+        return self._source_lines
+
+    def search_symbols(self, query: str, limit: int = 100) -> list[SymbolInfo]:
+        """Search for symbols whose name contains the query string.
+
+        Used for workspace/symbol requests. Case-insensitive substring match.
+
+        Args:
+            query: Search string (case-insensitive).
+            limit: Maximum number of results (default 100).
+
+        Returns:
+            List of matching SymbolInfo, ordered by:
+            1. Exact match first
+            2. Prefix match second
+            3. Substring match third
+            Within each group, alphabetical by name.
+        """
+        if not query:
+            # Return up to limit symbols, alphabetically
+            all_symbols: list[SymbolInfo] = []
+            for syms in self._symbols_by_name.values():
+                all_symbols.extend(syms)
+            all_symbols.sort(key=lambda s: s.name.lower())
+            return all_symbols[:limit]
+
+        query_lower = query.lower()
+        exact: list[SymbolInfo] = []
+        prefix: list[SymbolInfo] = []
+        substring: list[SymbolInfo] = []
+
+        for name, syms in self._symbols_by_name.items():
+            name_lower = name.lower()
+            if name_lower == query_lower:
+                exact.extend(syms)
+            elif name_lower.startswith(query_lower):
+                prefix.extend(syms)
+            elif query_lower in name_lower:
+                substring.extend(syms)
+
+        exact.sort(key=lambda s: s.name.lower())
+        prefix.sort(key=lambda s: s.name.lower())
+        substring.sort(key=lambda s: s.name.lower())
+
+        results = exact + prefix + substring
+        return results[:limit]
+
     def _extract_word_at(self, path: Path, position: FilePosition) -> str | None:
         """Extract the identifier word at the given position.
 
@@ -535,9 +588,9 @@ class _IndexBuilder:
         # Build port list detail string
         port_strs: list[str] = []
         for port in body.portList:
-            dir_str = _DIRECTION_MAP.get(port.direction, "")
-            type_str = str(port.type)
-            port_strs.append(f"{dir_str} {type_str} {port.name}")
+            dir_str = _DIRECTION_MAP.get(port.direction, "") if hasattr(port, "direction") else ""
+            type_str = str(port.type) if hasattr(port, "type") else ""
+            port_strs.append(f"{dir_str} {type_str} {port.name}".strip())
 
         # Build parameter list
         param_strs: list[str] = []
@@ -627,8 +680,13 @@ class _IndexBuilder:
         if location is None:
             return
 
-        dir_str = _DIRECTION_MAP.get(port.direction, "")
-        type_str = f"{dir_str} {port.type}" if dir_str else str(port.type)
+        if hasattr(port, "direction"):
+            dir_str = _DIRECTION_MAP.get(port.direction, "")
+            type_str = f"{dir_str} {port.type}" if dir_str else str(port.type)
+        else:
+            # InterfacePortSymbol — no direction attribute
+            dir_str = ""
+            type_str = str(port.type) if hasattr(port, "type") else port.name
 
         info = SymbolInfo(
             name=port.name,

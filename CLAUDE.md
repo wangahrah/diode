@@ -10,12 +10,12 @@ Editor  <--LSP/JSON-RPC-->  server.py  -->  compiler.py  -->  pyslang
                                 |                |
                                 v                v
                            project.py       index.py
-                                             |
-                                             v
-                                          hover.py
+                                |            |
+                                v            v
+                           hover.py    completion.py
 ```
 
-Six modules, one shared types file:
+Seven modules, one shared types file:
 
 | Module | Responsibility | Depends on |
 |--------|---------------|------------|
@@ -24,6 +24,7 @@ Six modules, one shared types file:
 | `compiler.py` | Drive pyslang compilation, extract diagnostics | `types.py` |
 | `index.py` | Walk compilation tree, build symbol lookup tables | `types.py` |
 | `hover.py` | Format hover markdown from SymbolInfo | `types.py` |
+| `completion.py` | Context detection, scope resolution, candidate generation | `types.py`, `index.py` |
 | `server.py` | pygls server, LSP handlers, orchestration | all of the above |
 
 ## The contract: types.py
@@ -58,13 +59,16 @@ Read `docs/architecture.md` for the full type definitions and public interfaces.
 - Use `logging` module, logger per module: `logger = logging.getLogger(__name__)`
 
 ### What NOT to do
-- **Do not write a SystemVerilog parser.** pyslang handles all parsing. Period.
-- **Do not use lsprotocol types inside non-server modules.** Only server.py imports from lsprotocol/pygls. All other modules use diode's own types.
-- **Do not cache pyslang AST nodes across compilations.** Each recompilation creates a new tree; old references become invalid.
+- **Do not write a SystemVerilog parser.** pyslang handles all parsing. Period. Context detection in `completion.py` uses simple backward text scanning on the current line — it identifies trigger patterns (`.`, `::`, `$`), not SV grammar.
+- **Do not use lsprotocol types inside non-server modules.** Only server.py imports from lsprotocol/pygls. All other modules (including completion.py) use diode's own types.
+- **Do not cache pyslang AST nodes across compilations.** Each recompilation creates a new tree; old references become invalid. Completion queries the live Compilation — don't store scope references.
 - **Do not use threads directly.** Use `@SERVER.thread()` for handlers that do work. pygls manages the thread pool.
 - **Do not import pyslang at module level in types.py.** Keep types.py dependency-free.
 - **Do not implement incremental compilation.** Full recompile every time. This is intentional.
-- **Do not add features beyond phase 1** (see concept.md). No completion, no rename, no code actions.
+- **Do not add features beyond phase 2 scope.** Phase 2 = completion + workspace symbols + document highlight. No code actions, no rename, no inlay hints.
+- **Do not pre-build a completion index.** Completion uses live pyslang queries against the retained Compilation object. The SymbolIndex is for definition/reference lookup, not completion enumeration.
+- **Do not implement macro/backtick completion.** Explicitly excluded from scope.
+- **Do not implement keyword completion.** Reserved for future use but not phase 2.
 
 ## Module implementation guide
 
@@ -102,14 +106,34 @@ Read `docs/architecture.md` for the full type definitions and public interfaces.
 - Instance hover: module name, parameter bindings
 - Keep formatting clean and concise — this appears in a small popup
 
+### completion.py (phase 2)
+- Entry point: `get_completions(compilation, index, path, position, trigger_char, source_lines) -> list[CompletionItem]`
+- Imports `types.py` and `pyslang` only — no pygls, no lsprotocol
+- **Context detection** (`_detect_context`): backward text scanning to determine what kind of completion (identifier, dot, package member, port connection, param override, system task, module name)
+- **Scope resolution** (`_find_scope_at_position`): walk pyslang semantic tree to find deepest scope containing cursor — this is the key new infrastructure
+- **Candidate generators** — one per context kind:
+  - `_complete_identifiers`: walk scope + parent scopes, enumerate members
+  - `_complete_module_names`: `compilation.getDefinitions()`
+  - `_complete_port_connections`: `inst.body.portList` minus already-connected
+  - `_complete_package_members`: `compilation.getPackage(name)` iteration
+  - `_complete_dot_members`: resolve prefix type, iterate struct/enum/class members
+  - `_complete_system_tasks`: curated list of common `$` tasks
+  - `_complete_param_overrides`: `inst.body.parameters`
+- Uses `LookupFlags.NoUndeclaredError` to avoid polluting diagnostics during completion
+- Returns `list[CompletionItem]` sorted by `sort_group` then `label`
+- See `docs/architecture.md` phase 2 section for full function signatures
+
 ### server.py
 - Creates the pygls `LanguageServer` instance
-- Registers LSP handlers: `textDocument/didOpen`, `didChange`, `didSave`, `didClose`, `definition`, `hover`, `references`, `documentSymbol`
+- Registers LSP handlers: `textDocument/didOpen`, `didChange`, `didSave`, `didClose`, `definition`, `hover`, `references`, `documentSymbol`, `textDocument/completion`, `workspace/symbol`, `textDocument/documentHighlight`
 - Orchestrates compilation → index rebuild → diagnostics publish cycle
-- Uses `@SERVER.thread()` for handlers that call compiler/index
-- Holds mutable state: `_config: ProjectConfig`, `_index: SymbolIndex | None`, `_compilation_lock: threading.Lock`
+- Uses `@SERVER.thread()` for handlers that call compiler/index/completion
+- Holds mutable state: `_config: ProjectConfig`, `_index: SymbolIndex | None`, `_compilation_result: CompilationResult | None`, `_compilation_lock: threading.Lock`
 - Open file tracking: maintains `dict[Path, str]` of editor buffer contents
 - Debounce: on `didChange`, schedule recompilation after 300ms idle (cancel previous timer)
+- Completion handler: passes `_compilation_result.compilation` and `_index` to `completion.get_completions()`, converts result to LSP types
+- Workspace symbol handler: calls `_index.search_symbols(query)`
+- Document highlight handler: calls `_index.find_references()`, filters to current file
 - `main()` function: argument parsing (--tcp, --port), starts server
 
 ## Threading model
@@ -135,7 +159,7 @@ Read `docs/architecture.md` for the full type definitions and public interfaces.
 
 - Use `pytest` with `pytest-lsp` for integration tests, `pytest-asyncio` for async
 - Test files live in `tests/`, fixtures in `tests/fixtures/`
-- One test file per module: `test_project.py`, `test_compiler.py`, `test_index.py`, `test_server.py`
+- One test file per module: `test_project.py`, `test_compiler.py`, `test_index.py`, `test_completion.py`, `test_server.py`
 - Unit tests call module functions directly with fixture data
 - Integration tests (test_server.py) use pytest-lsp to simulate a real LSP client
 - Test the contract, not the implementation — if the interface is satisfied, the test passes
@@ -159,16 +183,20 @@ diode/
       compiler.py        # pyslang compilation wrapper
       index.py           # symbol index
       hover.py           # hover content formatting
+      completion.py      # completion context detection + candidates (phase 2)
       server.py          # pygls LSP server
   tests/
     conftest.py          # shared fixtures
     test_project.py
     test_compiler.py
     test_index.py
+    test_completion.py   # completion unit tests (phase 2)
     test_server.py
     fixtures/
       simple_module.sv
       parameterized.sv
+      completion.sv          # completion-specific fixture (phase 2)
+      completion_structs.sv  # struct/enum dot-completion fixture (phase 2)
       cross_file/
         top.sv
         sub.sv

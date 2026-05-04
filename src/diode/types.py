@@ -172,3 +172,59 @@ class SymbolInfo:
     type_str: str | None = None      # human-readable type (e.g. "logic [7:0]")
     detail: str | None = None        # extra info for hover (port list, value, etc.)
     references: tuple[FileLocation, ...] = ()  # usage sites (populated by index)
+
+
+# ---------------------------------------------------------------------------
+# Completion (phase 2)
+# ---------------------------------------------------------------------------
+
+
+class CompletionContextKind(enum.Enum):
+    """The kind of completion context detected from cursor position and trigger."""
+
+    IDENTIFIER = "identifier"          # default: in-scope identifiers
+    DOT = "dot"                        # after '.': struct fields, interface members
+    PACKAGE_MEMBER = "package_member"  # after '::': package members
+    PORT_CONNECTION = "port_connection"  # inside '.port(': port names
+    PARAM_OVERRIDE = "param_override"  # inside '#(': parameter names
+    SYSTEM_TASK = "system_task"        # after '$': system tasks
+    MODULE_NAME = "module_name"        # module/interface names for instantiation
+
+
+class CompletionItemKind(enum.Enum):
+    """Completion item kind — mapped to LSP CompletionItemKind at server boundary.
+
+    Separate from DiodeSymbolKind because completion needs additional kinds
+    (FIELD, SYSTEM_TASK, KEYWORD) not present in the symbol index.
+    """
+
+    MODULE = "module"
+    INTERFACE = "interface"
+    PACKAGE = "package"
+    PORT = "port"
+    PARAMETER = "parameter"
+    SIGNAL = "signal"
+    FUNCTION = "function"
+    TASK = "task"
+    TYPEDEF = "typedef"
+    ENUM_MEMBER = "enum_member"
+    FIELD = "field"              # struct field (not a port or signal)
+    SYSTEM_TASK = "system_task"  # $display, $clog2, etc.
+    KEYWORD = "keyword"          # reserved for future use
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionItem:
+    """A single completion candidate.
+
+    Stored in diode's own format; converted to LSP CompletionItem at the
+    server boundary. sort_group controls priority ordering: lower values
+    appear first (0 = local scope, 1 = parent scope, 2 = global/imported).
+    """
+
+    label: str
+    kind: CompletionItemKind
+    detail: str | None = None           # type/signature shown inline
+    insert_text: str | None = None      # text to insert (if different from label)
+    sort_group: int = 0                 # 0=local, 1=enclosing, 2=global/imported
+    documentation: str | None = None    # extended docs (markdown)

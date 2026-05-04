@@ -1,6 +1,6 @@
 # Test Fixtures
 
-SystemVerilog files designed to exercise diode's phase 1 LSP features.
+SystemVerilog files designed to exercise diode's LSP features.
 Each file contains comments documenting expected LSP behavior at specific positions.
 
 ## Files
@@ -25,6 +25,19 @@ Compilation order: `pkg.sv`, `sub.sv`, `top.sv` (package must be compiled first)
 Tests: cross-file go-to-def (module instantiation, package import, typedef resolution),
 cross-file find-references, hover with imported types.
 
+### `completion.sv` (phase 2)
+A module that imports from `common_pkg` (cross_file/pkg.sv), instantiates
+`data_processor` (cross_file/sub.sv), and exercises all completion contexts.
+Must be compiled together with the cross_file/ sources.
+
+Tests: identifier completion (local + module + imported scopes), port connection
+completion (connected vs unconnected), package member completion, system task
+completion, module name completion, document highlight.
+
+### `completion_structs.sv` (phase 2)
+A package with struct and enum types, plus a module using them.
+Tests dot-completion for struct fields and workspace symbol search.
+
 ## Using in tests
 
 ```python
@@ -40,6 +53,18 @@ cross_files = [
     FIXTURES / "cross_file" / "pkg.sv",
     FIXTURES / "cross_file" / "sub.sv",
     FIXTURES / "cross_file" / "top.sv",
+]
+
+# Completion tests (includes cross_file sources + completion fixture)
+completion_files = [
+    FIXTURES / "cross_file" / "pkg.sv",
+    FIXTURES / "cross_file" / "sub.sv",
+    FIXTURES / "completion.sv",
+]
+
+# Struct completion tests
+struct_files = [
+    FIXTURES / "completion_structs.sv",
 ]
 ```
 

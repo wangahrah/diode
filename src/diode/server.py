@@ -1,7 +1,8 @@
 """LSP server for diode.
 
 Implements the pygls LanguageServer with handlers for didOpen, didChange,
-didSave, didClose, definition, hover, references, and documentSymbol.
+didSave, didClose, definition, hover, references, documentSymbol,
+completion, workspace symbol, and document highlight.
 Orchestrates compilation, index rebuild, and diagnostics publishing.
 """
 
@@ -18,10 +19,11 @@ import lsprotocol.types as lsp
 from pygls import uris as pygls_uris
 from pygls.lsp.server import LanguageServer
 
-from diode import compiler, hover, index, project
+from diode import compiler, completion, hover, index, project
 from diode.index import SymbolIndex
 from diode.types import (
     CompilationResult,
+    CompletionItemKind,
     DiodeDiagnostic,
     DiodeSeverity,
     DiodeSymbolKind,
@@ -50,6 +52,7 @@ SERVER = LanguageServer(
 
 _config: ProjectConfig | None = None
 _index: SymbolIndex | None = None
+_compilation_result: CompilationResult | None = None
 _open_files: dict[Path, str] = {}
 _compilation_lock = threading.Lock()
 _recompile_timer: threading.Timer | None = None
@@ -84,6 +87,28 @@ _SEVERITY_MAP: dict[DiodeSeverity, lsp.DiagnosticSeverity] = {
     DiodeSeverity.INFO: lsp.DiagnosticSeverity.Information,
     DiodeSeverity.HINT: lsp.DiagnosticSeverity.Hint,
 }
+
+# Completion kind mapping from diode to LSP
+_COMPLETION_KIND_MAP: dict[CompletionItemKind, lsp.CompletionItemKind] = {
+    CompletionItemKind.MODULE: lsp.CompletionItemKind.Module,
+    CompletionItemKind.INTERFACE: lsp.CompletionItemKind.Interface,
+    CompletionItemKind.PACKAGE: lsp.CompletionItemKind.Module,
+    CompletionItemKind.PORT: lsp.CompletionItemKind.Property,
+    CompletionItemKind.PARAMETER: lsp.CompletionItemKind.Constant,
+    CompletionItemKind.SIGNAL: lsp.CompletionItemKind.Variable,
+    CompletionItemKind.FUNCTION: lsp.CompletionItemKind.Function,
+    CompletionItemKind.TASK: lsp.CompletionItemKind.Function,
+    CompletionItemKind.TYPEDEF: lsp.CompletionItemKind.Struct,
+    CompletionItemKind.ENUM_MEMBER: lsp.CompletionItemKind.EnumMember,
+    CompletionItemKind.FIELD: lsp.CompletionItemKind.Field,
+    CompletionItemKind.SYSTEM_TASK: lsp.CompletionItemKind.Function,
+    CompletionItemKind.KEYWORD: lsp.CompletionItemKind.Keyword,
+}
+
+
+def _completion_kind_to_lsp(kind: CompletionItemKind) -> lsp.CompletionItemKind:
+    """Map CompletionItemKind to LSP CompletionItemKind."""
+    return _COMPLETION_KIND_MAP.get(kind, lsp.CompletionItemKind.Variable)
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +189,7 @@ def _do_recompile() -> None:
     5. Publish diagnostics for all open files
     6. Release lock
     """
-    global _index, _recompile_timer
+    global _index, _compilation_result, _recompile_timer
 
     if _config is None:
         return
@@ -174,6 +199,7 @@ def _do_recompile() -> None:
             result = compiler.compile_project(_config, _open_files)
             new_index = index.build_index(result)
             _index = new_index
+            _compilation_result = result
             _publish_diagnostics(result)
         except Exception:
             logger.exception("Recompilation failed")
@@ -428,6 +454,152 @@ def on_document_symbol(params: lsp.DocumentSymbolParams) -> list[lsp.DocumentSym
         return None
 
     return _build_document_symbol_hierarchy(symbols)
+
+
+@SERVER.thread()
+@SERVER.feature(
+    lsp.TEXT_DOCUMENT_COMPLETION,
+    lsp.CompletionOptions(
+        trigger_characters=[".", ":", "$"],
+    ),
+)
+def on_completion(params: lsp.CompletionParams) -> lsp.CompletionList | None:
+    """Completion handler.
+
+    1. Get compilation and index (bail if either is None)
+    2. Convert LSP position to FilePosition
+    3. Extract trigger character from params.context
+    4. Call completion.get_completions(...)
+    5. Convert diode CompletionItems to LSP CompletionItems
+    6. Return CompletionList(is_incomplete=False, items=...)
+    """
+    current_index = _index
+    current_result = _compilation_result
+    if current_index is None or current_result is None:
+        return None
+
+    path = _uri_to_path(params.text_document.uri)
+    pos = _from_lsp_position(params.position)
+
+    trigger: str | None = None
+    if params.context is not None:
+        trigger = params.context.trigger_character
+
+    items = completion.get_completions(
+        current_result.compilation,
+        current_index,
+        path,
+        pos,
+        trigger,
+        current_index.source_lines,
+    )
+
+    lsp_items: list[lsp.CompletionItem] = []
+    for item in items:
+        lsp_items.append(
+            lsp.CompletionItem(
+                label=item.label,
+                kind=_completion_kind_to_lsp(item.kind),
+                detail=item.detail,
+                insert_text=item.insert_text or item.label,
+                sort_text=f"{item.sort_group:02d}_{item.label}",
+                documentation=(
+                    lsp.MarkupContent(
+                        kind=lsp.MarkupKind.Markdown,
+                        value=item.documentation,
+                    )
+                    if item.documentation
+                    else None
+                ),
+            )
+        )
+
+    return lsp.CompletionList(is_incomplete=False, items=lsp_items)
+
+
+@SERVER.thread()
+@SERVER.feature(lsp.WORKSPACE_SYMBOL)
+def on_workspace_symbol(params: lsp.WorkspaceSymbolParams) -> list[lsp.SymbolInformation] | None:
+    """Workspace symbol handler (Ctrl+T / Telescope symbol search).
+
+    1. Get query string from params
+    2. Call _index.search_symbols(query)
+    3. Convert each SymbolInfo to lsp.SymbolInformation
+    4. Return list of SymbolInformation
+    """
+    current_index = _index
+    if current_index is None:
+        return None
+
+    symbols = current_index.search_symbols(params.query)
+    if not symbols:
+        return None
+
+    result: list[lsp.SymbolInformation] = []
+    for sym in symbols:
+        result.append(
+            lsp.SymbolInformation(
+                name=sym.name,
+                kind=_symbol_kind_to_lsp(sym.kind),
+                location=_to_lsp_location(sym.definition),
+            )
+        )
+
+    return result
+
+
+@SERVER.thread()
+@SERVER.feature(lsp.TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT)
+def on_document_highlight(params: lsp.DocumentHighlightParams) -> list[lsp.DocumentHighlight] | None:
+    """Document highlight handler.
+
+    1. Convert position, lookup symbol via _index.lookup_at()
+    2. Call _index.find_references(symbol.name)
+    3. Filter to same file only
+    4. For each reference in the same file:
+       - If it matches the symbol's definition location: kind = Write
+       - Otherwise: kind = Read
+    5. Return list of DocumentHighlight
+    """
+    current_index = _index
+    if current_index is None:
+        return None
+
+    path = _uri_to_path(params.text_document.uri)
+    pos = _from_lsp_position(params.position)
+
+    symbol = current_index.lookup_at(path, pos)
+    if symbol is None:
+        return None
+
+    refs = current_index.find_references(symbol.name)
+
+    highlights: list[lsp.DocumentHighlight] = []
+    for ref in refs:
+        # Filter to same file
+        if ref.path.resolve() != path:
+            continue
+
+        # Determine highlight kind
+        is_definition = (
+            ref.path == symbol.definition.path
+            and ref.range.start.line == symbol.definition.range.start.line
+            and ref.range.start.column == symbol.definition.range.start.column
+        )
+        kind = (
+            lsp.DocumentHighlightKind.Write
+            if is_definition
+            else lsp.DocumentHighlightKind.Read
+        )
+
+        highlights.append(
+            lsp.DocumentHighlight(
+                range=_to_lsp_range(ref.range),
+                kind=kind,
+            )
+        )
+
+    return highlights if highlights else None
 
 
 def _build_document_symbol_hierarchy(symbols: list[SymbolInfo]) -> list[lsp.DocumentSymbol]:
