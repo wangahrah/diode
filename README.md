@@ -4,8 +4,21 @@ A SystemVerilog language server built on [pyslang](https://github.com/MikePopolo
 
 ## Install
 
+Diode is not yet on PyPI. Install the latest from git with [pipx](https://pipx.pypa.io/):
+
 ```bash
-pip install diode-ls
+pipx install git+https://github.com/wangahrah/diode.git
+```
+
+This puts `diode-ls` on your PATH in its own private virtualenv. Upgrade with `pipx upgrade diode-ls`.
+
+For development:
+
+```bash
+git clone https://github.com/wangahrah/diode.git
+cd diode
+python -m venv .venv && source .venv/bin/activate
+pip install -e .[dev]
 ```
 
 ## Usage
